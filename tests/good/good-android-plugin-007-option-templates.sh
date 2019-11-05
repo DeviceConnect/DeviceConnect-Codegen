@@ -2,6 +2,7 @@
 
 java -jar ../../bin/deviceconnect-codegen.jar \
      --lang                  deviceConnectAndroidPlugin \
+     --template-dir templates/deviceConnectAndroidPlugin \
      --package-name com.mydomain.testplugin007 \
      --display-name Test007 \
      --input-spec            profile-specs/swagger.json \
@@ -9,4 +10,5 @@ java -jar ../../bin/deviceconnect-codegen.jar \
      --template-dir          test-assets/007/templates/ \
      --sdk                   test-assets/007/sdk/ \
      --signing-configs       test-assets/007/signingConfigs/ \
-     --gradle-plugin-version 3.0.1
+     --gradle-plugin-version 3.0.1 \
+     --config configs/android-plugin.json

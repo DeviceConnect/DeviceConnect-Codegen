@@ -7,25 +7,24 @@
 package org.deviceconnect.codegen;
 
 
+import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.dataformat.yaml.YAMLFactory;
 import com.github.fge.jsonschema.core.exceptions.ProcessingException;
-import config.Config;
-import config.ConfigParser;
+import com.google.common.collect.ImmutableMap;
 import io.swagger.codegen.*;
-import io.swagger.models.Info;
-import io.swagger.models.Model;
-import io.swagger.models.Path;
-import io.swagger.models.Swagger;
+import io.swagger.models.*;
 import io.swagger.parser.SwaggerParser;
 import org.apache.commons.cli.*;
 import org.deviceconnect.codegen.app.HtmlAppCodegenConfig;
 import org.deviceconnect.codegen.docs.HtmlDocsCodegenConfig;
 import org.deviceconnect.codegen.docs.MarkdownDocsCodegenConfig;
-import org.deviceconnect.codegen.util.SortedSwagger;
-import org.deviceconnect.codegen.util.SwaggerJsonValidator;
-import org.deviceconnect.codegen.util.SwaggerUtils;
+import org.deviceconnect.codegen.error.DConnectError;
+import org.deviceconnect.codegen.error.ErrorUtils;
+import org.deviceconnect.codegen.error.Errors;
+import org.deviceconnect.codegen.util.*;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -35,6 +34,7 @@ import java.io.IOException;
 import java.util.*;
 
 import static org.deviceconnect.codegen.Const.MESSAGES;
+import static org.deviceconnect.codegen.error.ErrorUtils.reportError;
 
 public class DConnectCodegen {
 
@@ -66,7 +66,7 @@ public class DConnectCodegen {
 
     @SuppressWarnings("deprecation")
     public static void main(String[] args) {
-        Options options = Const.OPTIONS;
+        System.setProperty("org.slf4j.simpleLogger.defaultLogLevel", "warn");
 
         ClientOptInput clientOptInput = new ClientOptInput();
         ClientOpts clientOpts = new ClientOpts();
@@ -75,6 +75,15 @@ public class DConnectCodegen {
         try {
             CommandLineParser parser = new BasicParser();
             DConnectCodegenConfig config;
+
+            Options options = Const.MAIN_OPTIONS;
+            try {
+                cmd = parser.parse(Const.HELP_OPTION, args);
+                if (cmd.hasOption("h")) {
+                    usage(options);
+                    return;
+                }
+            } catch (ParseException ignored) {}
 
             cmd = parser.parse(options, args);
             if (cmd.hasOption("d")) {
@@ -100,22 +109,48 @@ public class DConnectCodegen {
                 return;
             }
             if (cmd.hasOption("o")) {
-                config.setOutputDir(cmd.getOptionValue("o"));
+                String output = cmd.getOptionValue("o");
+                File outputDir = new File(output);
+                if (outputDir.exists()) {
+                    if (!outputDir.canWrite()) {
+                        ErrorUtils.reportError(new Errors.NoWritePermission(outputDir));
+                        return;
+                    }
+                    if (cmd.hasOption("w")) {
+                        deleteDirectoryOrFile(outputDir);
+                    } else {
+                        // （上書き禁止の場合）すでに出力先にフォルダが存在している
+                        ErrorUtils.reportError(new Errors.AlreadyCreatedTarget(outputDir));
+                        return;
+                    }
+                }
+                config.setOutputDir(output);
             }
+
             if (cmd.hasOption("i")) {
                 File file = new File(cmd.getOptionValue("i"));
-                parseSwaggerFromFile(file, clientOptInput, config);
+                if (file.isFile()) {
+                    if(!parseSwaggerFromFile(file, clientOptInput, config)) {
+                        return;
+                    }
+                } else if (file.isDirectory()) {
+                    File dir = file;
+                    if(!parseSwaggerFromDirectory(dir, clientOptInput, config)) {
+                        return;
+                    }
+                }
             } else if (cmd.hasOption("s")) {
                 File dir = new File(cmd.getOptionValue("s"));
                 if (dir.isDirectory()) {
-                    parseSwaggerFromDirectory(dir, clientOptInput, config);
+                    if(!parseSwaggerFromDirectory(dir, clientOptInput, config)) {
+                        return;
+                    }
                 } else {
                     // TODO エラーメッセージ詳細化: ディレクトリではなくファイルへのパスが指定されている.
                     usage(options);
                     return;
                 }
             }
-
 
             if (cmd.hasOption("c")) {
                 String configFile = cmd.getOptionValue("c");
@@ -126,10 +161,20 @@ public class DConnectCodegen {
                             config.additionalProperties().put(langCliOption.getOpt(), genConfig.getOption(langCliOption.getOpt()));
                         }
                     }
+                    config.additionalProperties().putAll(genConfig.getAdditionalProperties());
+
+                    for (Map.Entry<String, Object> prop : config.additionalProperties().entrySet()) {
+                        LOGGER.info("Parsed additionProperties: " + prop.getKey() + "=" + prop.getValue());
+                    }
                 }
             }
             if (cmd.hasOption("t")) {
-                clientOpts.getProperties().put(CodegenConstants.TEMPLATE_DIR, String.valueOf(cmd.getOptionValue("t")));
+                String dirPath = String.valueOf(cmd.getOptionValue("t"));
+                if (!new File(dirPath).exists()) {
+                    reportError(new Errors.TemplateDirNotFound(dirPath));
+                    return;
+                }
+                clientOpts.getProperties().put(CodegenConstants.TEMPLATE_DIR, dirPath);
             }
 
             String displayName;
@@ -152,7 +197,7 @@ public class DConnectCodegen {
             if (cmd.hasOption("r")) {
                 gradlePluginVersion = cmd.getOptionValue("r");
             } else {
-                gradlePluginVersion = "3.0.0";
+                gradlePluginVersion = "3.1.0";
             }
             clientOpts.getProperties().put("gradlePluginVersion", gradlePluginVersion);
 
@@ -165,34 +210,8 @@ public class DConnectCodegen {
                 }
                 return;
             }
-        } catch (MissingOptionException e) {
-            printError(Const.ErrorMessages.CommandOption.MISSING_OPTION.getMessage(e.getMissingOptions()));
-            return;
-        } catch (MissingArgumentException e) {
-            printError(Const.ErrorMessages.CommandOption.MISSING_ARGUMENT.getMessage(e.getOption()));
-            return;
-        } catch (AlreadySelectedException e) {
-            printError(Const.ErrorMessages.CommandOption.ALREADY_SELECTED_OPTION.getMessage(e.getOption()));
-            return;
-        } catch (UnrecognizedOptionException e) {
-            printError(Const.ErrorMessages.CommandOption.UNDEFINED_OPTION.getMessage(e.getOption()));
-            return;
-        } catch (IllegalPathFormatException e) {
-            String errorMessage;
-            switch (e.getReason()) {
-                case TOO_LONG:
-                    errorMessage = Const.ErrorMessages.Path.TOO_LONG.getMessage(e.getPath());
-                    break;
-                case TOO_SHORT:
-                    errorMessage = Const.ErrorMessages.Path.TOO_SHORT.getMessage(e.getPath());
-                    break;
-                case NOT_STARTED_WITH_ROOT:
-                    errorMessage = Const.ErrorMessages.Path.NOT_STARTED_WITH_ROOT.getMessage(e.getPath());
-                    break;
-                default:
-                    throw new RuntimeException("Undefined error");
-            }
-            printError(errorMessage);
+        } catch (ParseException e) {
+            reportError(e);
             return;
         } catch (DuplicatedPathException e) {
             printDuplicatedPathError(e);
@@ -221,14 +240,38 @@ public class DConnectCodegen {
         }
     }
 
-    private static void parseSwaggerFromFile(File file,
+    private static boolean deleteDirectoryOrFile(final File file) {
+        if (file.isFile()) {
+            return file.delete();
+        }
+        return deleteDirectory(file);
+    }
+
+    private static boolean deleteDirectory(final File dir) {
+        File[] children = dir.listFiles();
+        if (children != null) {
+            for (File child : children) {
+                boolean deleted = deleteDirectory(child);
+                if (!deleted) {
+                    return false;
+                }
+            }
+        }
+        return dir.delete();
+    }
+
+    private static boolean parseSwaggerFromFile(File file,
                                              ClientOptInput clientOptInput,
                                              DConnectCodegenConfig config)
         throws IOException, ProcessingException {
-        if(!checkSwagger(file)) {
-            return;
+        if(!checkJsonAndSwagger(file)) {
+            return false;
         }
         Swagger swagger = new SwaggerParser().read(file.getAbsolutePath(), clientOptInput.getAuthorizationValues(), true);
+        if (!checkDeviceConnect(file, swagger)) {
+            return false;
+        }
+
         clientOptInput.swagger(swagger);
 
         String basePath = swagger.getBasePath();
@@ -269,9 +312,10 @@ public class DConnectCodegen {
         }
         config.setProfileSpecs(profiles);
         config.setOriginalSwagger(SwaggerUtils.cloneSwagger(swagger));
+        return true;
     }
 
-    private static void parseSwaggerFromDirectory(File dir,
+    private static boolean parseSwaggerFromDirectory(File dir,
                                                   ClientOptInput clientOptInput,
                                                   DConnectCodegenConfig config)
             throws IOException, ProcessingException, IllegalPathFormatException, DuplicatedPathException {
@@ -282,11 +326,17 @@ public class DConnectCodegen {
             }
         });
         List<Swagger> swaggerList = new ArrayList<>();
+        boolean success = true;
         for (File file : specFiles) {
-            if(!checkSwagger(file)) {
+            success &= checkJsonAndSwagger(file);
+            if(!success) {
                 continue;
             }
             Swagger swagger = new SwaggerParser().read(file.getAbsolutePath(), clientOptInput.getAuthorizationValues(), true);
+            success &= checkDeviceConnect(file, swagger);
+            if(!success) {
+                continue;
+            }
 
             String basePath = swagger.getBasePath();
             if (basePath == null || basePath.equals("")) {
@@ -297,8 +347,8 @@ public class DConnectCodegen {
                 swaggerList.add(swagger);
             }
         }
-        if (swaggerList.size() != specFiles.length) {
-            return;
+        if (!success) {
+            return false;
         }
 
         Map<String, Swagger> profileSpecs = SWAGGER_CONVERTER.convert(swaggerList);
@@ -309,9 +359,10 @@ public class DConnectCodegen {
         Swagger swagger = mergeSwaggers(profileSpecs);
         config.setOriginalSwagger(SwaggerUtils.cloneSwagger(swagger));
         clientOptInput.swagger(swagger);
+        return true;
     }
 
-    private static boolean checkSwagger(final File file) throws IOException, ProcessingException {
+    private static boolean checkJsonAndSwagger(final File file) throws IOException, ProcessingException {
         String fileName = file.getName();
         ObjectMapper mapper;
         if (fileName.endsWith(".yaml")) {
@@ -322,22 +373,171 @@ public class DConnectCodegen {
             throw new IllegalArgumentException("file must be JSON or YAML.");
         }
 
-        JsonNode jsonNode = mapper.readTree(file);
+        JsonNode jsonNode;
+        try {
+            jsonNode = mapper.readTree(file);
+            return checkSwagger(file, jsonNode);
+        } catch (JsonProcessingException e) {
+            reportError(new Errors.InvalidJson(file, e));
+            return false;
+        }
+    }
+
+    private static boolean checkSwagger(final File file, final JsonNode jsonNode) throws IOException, ProcessingException {
         SwaggerJsonValidator.Result result = JSON_VALIDATOR.validate(jsonNode);
-        if (result.isSuccess()) {
-            return true;
+        if (!result.isSuccess()) {
+            reportError(new Errors.InvalidSwagger(file, result.getErrors()));
+            return false;
+        }
+        return true;
+    }
+
+    private static boolean checkDeviceConnect(final File file, final Swagger swagger) {
+        List<DConnectError> errors = new ArrayList<>();
+
+        Map<String, Path> paths = swagger.getPaths();
+        String basePath = swagger.getBasePath();
+        for (Map.Entry<String, Path> path : paths.entrySet()) {
+            String subPath = path.getKey();
+
+            // API パスの不正チェック
+            try {
+                throwIfIllegalPathFormat(basePath, subPath);
+            } catch (IllegalPathFormatException e) {
+                DConnectError error;
+                switch (e.getReason()) {
+                    case TOO_SHORT:
+                    case TOO_LONG:
+                        error = new Errors.InvalidPathLength(file, e.getPath());
+                        break;
+                    case NOT_STARTED_WITH_ROOT:
+                        error = new Errors.InvalidPathNotStartedWithRoot(file, e.getPath());
+                        break;
+                    default:
+                        throw new IllegalArgumentException();
+                }
+                errors.add(error);
+            }
+
+            Map<HttpMethod, Operation> opMap = path.getValue().getOperationMap();
+            if (opMap != null) {
+                for (Map.Entry<HttpMethod, Operation> entry : opMap.entrySet()) {
+                    HttpMethod method = entry.getKey();
+                    Operation op = entry.getValue();
+                    String id = op.getOperationId();
+                    String type = getOperationType(op);
+
+                    if (id == null) {
+                        // Operation ID が指定されていない
+                        errors.add(new Errors.MissingOperationId(file, path.getKey()));
+                    }
+
+                    if (type == null) {
+                        // API タイプが指定されていない
+                        errors.add(new Errors.MissingOperationType(file, path.getKey()));
+                    } else if (! ("one-shot".equals(type) || "event".equals(type) || "streaming".equals(type))) {
+                        // API タイプが不正
+                        errors.add(new Errors.UnknownOperationType(file, path.getKey()));
+                    } else if (method == HttpMethod.PUT && "event".equals(type)) {
+                        Object event = getEventMessage(op);
+                        if (event == null) {
+                            // イベント API に対してイベントメッセージが定義されていない
+                            errors.add(new Errors.MissingEvent(file, path.getKey()));
+                        } else {
+                            // イベントメッセージの定義が不正 (必須プロパティがない)
+                            // TODO
+                        }
+                    }
+
+                    // メソッドが不正でないこと
+                    if (!(method == HttpMethod.GET || method == HttpMethod.POST || method == HttpMethod.PUT ||method == HttpMethod.DELETE)) {
+                        errors.add(new Errors.InvalidMethod(file, path.getKey()));
+                    }
+                }
+            }
         }
 
-        String template = Const.ErrorMessages.CommandOption.INVALID_SWAGGER.getMessage();
-        String errorMessage = template.replace("%file%", file.getName());
-        String reasons = "";
-        for (SwaggerJsonValidator.Error error : result.getErrors()) {
-            String pointer = error.getJsonPointer();
-            String reason = error.getMessage();
-            reasons += " - Pointer = " + pointer + ", Reason = " + reason + "\n";
+        if (errors.size() > 0) {
+            for (DConnectError error : errors) {
+                ErrorUtils.reportError(error);
+            }
+            return false;
         }
-        printError(errorMessage + ": \n" + reasons);
-        return false;
+        return true;
+    }
+
+    private static void throwIfIllegalPathFormat(final String basePath, final String subPath) throws IllegalPathFormatException {
+        final String separator = DConnectPath.SEPARATOR;
+        if (!basePath.startsWith(separator)) {
+            throw new IllegalPathFormatException(IllegalPathFormatException.Reason.NOT_STARTED_WITH_ROOT, basePath);
+        }
+        if (!subPath.startsWith(separator)) {
+            throw new IllegalPathFormatException(IllegalPathFormatException.Reason.NOT_STARTED_WITH_ROOT, subPath);
+        }
+        String path = canonicalizePath(basePath, subPath);
+        String[] parts = path.split(separator);
+        int length = parts.length;
+        if (length < 3) {
+            throw new IllegalPathFormatException(IllegalPathFormatException.Reason.TOO_SHORT, path);
+        } else if (length > 5) {
+            throw new IllegalPathFormatException(IllegalPathFormatException.Reason.TOO_LONG, path);
+        }
+    }
+
+    private static String canonicalizePath(final String basePath, final String subPath) {
+        String path = basePath.equals(DConnectPath.SEPARATOR) ? subPath : basePath + subPath;
+
+        // 空白のパス要素は無視
+        String[] parts = path.split(DConnectPath.SEPARATOR);
+        List<String> result = new ArrayList<>();
+        for (String part : parts) {
+            if ("".equals(part)) {
+                continue;
+            }
+            result.add(part);
+        }
+        return concatParts(DConnectPath.SEPARATOR, result.toArray(new String[result.size()]));
+    }
+
+    private static String concatParts(String separator, String... parts) {
+        if (parts == null) {
+            return separator;
+        }
+        String path = separator;
+        for (int i = 0; i < parts.length; i++) {
+            if (parts[i] == null) {
+                continue;
+            }
+            path += parts[i];
+            if (i < parts.length - 1) {
+                path += separator;
+            }
+        }
+        return path;
+    }
+
+    private static String getOperationType(final Operation operation) {
+        Map<String, Object> extensions = operation.getVendorExtensions();
+        if (extensions == null) {
+            return null;
+        }
+        Object type = extensions.get("x-type");
+        if (type instanceof String) {
+            return (String) type;
+        }
+        return null;
+    }
+
+    private static HashMap getEventMessage(final Operation operation) {
+        Map<String, Object> extensions = operation.getVendorExtensions();
+        if (extensions == null) {
+            return null;
+        }
+        Object event = extensions.get("x-event");
+        if (event instanceof HashMap) {
+            return (HashMap) event;
+        }
+        return null;
     }
 
     private static void printError(final String message) {
@@ -345,7 +545,7 @@ public class DConnectCodegen {
     }
 
     private static void printDuplicatedPathError(final DuplicatedPathException e) {
-        String template = MESSAGES.getString("errorProfileSpecDuplicatedPath");
+        String template = MESSAGES.getString("errorDuplicatedPath");
         List<NameDuplication> duplications = e.getDuplications();
 
         String pathNames = "";
@@ -357,7 +557,7 @@ public class DConnectCodegen {
             }
         }
 
-        String errorMessage = template.replace("%paths%", pathNames);
+        String errorMessage = template.replace("{{paths}}", pathNames);
         printError(errorMessage);
     }
 
@@ -510,4 +710,66 @@ public class DConnectCodegen {
         formatter.printHelp("DConnectCodegen", options);
     }
 
+    private static class Config {
+
+        private final Map<String, String> options = new HashMap<>();
+        private final Map<String, Object> additionalProperties = new HashMap<>();
+
+        Map<String, String> getOptions() {
+            return ImmutableMap.copyOf(options);
+        }
+
+        boolean hasOption(String opt) {
+            return options.containsKey(opt);
+        }
+
+        String getOption(String opt) {
+            return options.get(opt);
+        }
+
+        void setOption(String opt, String value) {
+            options.put(opt, value);
+        }
+
+        Map<String, Object> getAdditionalProperties() {
+            return ImmutableMap.copyOf(additionalProperties);
+        }
+
+        void addAdditionalProperties(final Map<String, Object> properties) {
+            additionalProperties.putAll(properties);
+        }
+    }
+
+    private static class ConfigParser {
+
+        private static final Logger LOGGER = LoggerFactory.getLogger(config.ConfigParser.class);
+
+        public static Config read(String location) {
+           ObjectMapper mapper = new ObjectMapper();
+
+            Config config = new Config();
+
+            try {
+                JsonNode rootNode = mapper.readTree(new File(location));
+                Iterator<Map.Entry<String, JsonNode>> optionNodes = rootNode.fields();
+
+                while (optionNodes.hasNext()) {
+                    Map.Entry<String, JsonNode> optionNode = optionNodes.next();
+                    if (optionNode.getValue().isValueNode()) {
+                        config.setOption(optionNode.getKey(), optionNode.getValue().asText());
+                    } else if (optionNode.getValue().isObject() && "additionalProperties".equals(optionNode.getKey())) {
+                        Map<String, Object> map = mapper.convertValue(optionNode.getValue(), new TypeReference<Map<String, Object>>() {});
+                        config.addAdditionalProperties(map);
+                    } else {
+                        LOGGER.warn("omitting non-value node " + optionNode.getKey());
+                    }
+                }
+            } catch (Exception e) {
+                LOGGER.error(e.getMessage());
+                return null;
+            }
+
+            return config;
+        }
+    }
 }

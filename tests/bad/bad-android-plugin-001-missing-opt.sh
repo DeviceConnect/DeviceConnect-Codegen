@@ -10,8 +10,8 @@ CONNECTION_TYPE="binder"
 DISPLAY_NAME="MyPlugin"
 
 # スケルトンコード生成ツールのバイナリ
-JAR_FILE="../bin/deviceconnect-codegen.jar"
+JAR_FILE="../../bin/deviceconnect-codegen.jar"
 
-ARGS="--package-name $PACKAGE_NAME  --connection-type $CONNECTION_TYPE  --display-name $DISPLAY_NAME"
+ARGS="--template-dir templates/deviceConnectAndroidPlugin  --package-name $PACKAGE_NAME  --connection-type $CONNECTION_TYPE  --display-name $DISPLAY_NAME"
 
 java -Dfile.encoding=UTF-8 -jar $JAR_FILE $ARGS

@@ -2,8 +2,10 @@
 
 java -jar ../../bin/deviceconnect-codegen.jar \
      --lang         deviceConnectAndroidPlugin \
+     --template-dir templates/deviceConnectAndroidPlugin \
      --package-name com.mydomain.testplugin005 \
      --display-name Test005 \
      --input-spec   profile-specs/swagger.json \
      --output       output/android-plugin-005 \
-     --class-prefix Your
+     --class-prefix Your \
+     --config configs/android-plugin.json
